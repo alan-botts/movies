@@ -20,7 +20,7 @@ var (
 var showtimesCmd = &cobra.Command{
 	Use:   "showtimes <zip>",
 	Short: "Search for movie showtimes near a zip code",
-	Long:  "Search for movie showtimes at theaters near the given US zip code. Uses the SerpApi Google Showtimes API.",
+	Long:  "Search for movie showtimes at theaters near the given US zip code by scraping Google directly.",
 	Args:  cobra.ExactArgs(1),
 	RunE:  runShowtimes,
 }
@@ -54,12 +54,12 @@ func runShowtimes(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("Searching showtimes near %s (radius: %d mi, date: %s)...\n\n", zip, radius, date)
 
-	provider, err := showtimes.NewSerpApiProvider()
+	client, err := showtimes.NewGoogleClient()
 	if err != nil {
-		return fmt.Errorf("failed to create provider: %w", err)
+		return fmt.Errorf("failed to create client: %w", err)
 	}
 
-	results, err := provider.Search(zip, date)
+	results, err := client.Search(zip, date)
 	if err != nil {
 		return fmt.Errorf("showtime search failed: %w", err)
 	}

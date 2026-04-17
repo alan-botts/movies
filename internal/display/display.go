@@ -45,7 +45,7 @@ func PrintShowtimes(movies []showtimes.Movie, zip, date string) {
 	}
 
 	fmt.Printf("\n%s\n", strings.Repeat("=", 60))
-	fmt.Printf("Data from SerpApi (Google Showtimes). %d movies, %d theaters total.\n",
+	fmt.Printf("Data scraped from Google Showtimes. %d movies, %d theaters total.\n",
 		len(movies), countTheaters(movies))
 }
 

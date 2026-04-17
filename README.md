@@ -4,23 +4,9 @@ A Go CLI tool that searches for movie showtimes near a US zip code.
 
 ## Data Source
 
-Uses [SerpApi](https://serpapi.com/) to query Google's showtime results. SerpApi has a free tier (250 searches/month).
-
-### Setup
-
-1. Sign up at https://serpapi.com (free tier available)
-2. Copy your API key from the dashboard
-3. Export it:
-
-```bash
-export SERPAPI_API_KEY=your_key_here
-```
-
-Or store it with goat creds:
-
-```bash
-./goat creds set SERPAPI_API_KEY your_key_here
-```
+Scrapes Google Search directly for showtime results, using a TLS-fingerprinted
+HTTP client (same approach as the [traveler](../traveler/) tool for Google
+Flights). No API keys required.
 
 ## Build
 
@@ -48,6 +34,18 @@ Movies are grouped by title. Under each movie, theaters are listed with:
 - Theater address
 - Showtimes grouped by format (Standard, IMAX, Dolby Cinema, etc.)
 
+## How It Works
+
+The tool uses `github.com/bogdanfinn/tls-client` to create an HTTP client with
+a Chrome TLS fingerprint, making requests indistinguishable from a real browser.
+It then parses the server-rendered HTML from Google Search to extract movie
+titles, theater names, addresses, and showtimes.
+
+Multiple parsing strategies are tried in order:
+1. DOM-based extraction using `data-attrid` and class patterns
+2. Script tag JSON extraction for embedded structured data
+3. Regex-based fallback for aria-labels and text patterns
+
 ## Project Structure
 
 ```
@@ -58,18 +56,10 @@ movies/
 │       └── showtimes.go    # Showtimes subcommand
 ├── internal/
 │   ├── showtimes/
-│   │   └── provider.go     # SerpApi data provider
+│   │   └── provider.go     # Google scraper with TLS fingerprinting
 │   └── display/
 │       └── display.go      # Output formatting
 ├── main.go                 # Entry point
 ├── go.mod
 └── README.md
 ```
-
-## API Response
-
-SerpApi returns showtimes in two possible formats:
-1. **Movie-centric**: Movies at the top level, theaters nested under each movie
-2. **Theater-centric**: Theaters at the top level, movies nested under each theater
-
-The provider handles both formats and normalizes them into a movie-grouped structure.
