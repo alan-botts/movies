@@ -1,376 +1,492 @@
 package showtimes
 
 import (
-	"encoding/json"
 	"fmt"
+	"math"
+	"net/http"
+	"regexp"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/go-rod/rod"
-	"github.com/go-rod/rod/lib/launcher"
-	"github.com/go-rod/stealth"
+	"golang.org/x/net/html"
 )
 
-// Movie represents a movie with its showtimes at various theaters.
+// Movie represents a movie with its showtimes across theaters.
 type Movie struct {
 	Title    string
-	Link     string
-	Theaters []TheaterShowings
+	Rating   string // PG-13, R, Not Rated, etc.
+	Runtime  string // "1:35"
+	Theaters []TheaterShowtime
 }
 
-// TheaterShowings represents a single theater's showtimes for a movie.
-type TheaterShowings struct {
-	Name     string
-	Address  string
-	Distance string
-	Showings []Showing
+// TheaterShowtime holds showtime data for one movie at one theater.
+type TheaterShowtime struct {
+	TheaterID int
+	Name      string
+	City      string
+	Showtimes []string // ["1:30", "6:15", "8:30"]
+	Features  string   // "Stadium Seating; Digital Projection"
 }
 
-// Showing represents a showtime entry (may have a format like IMAX, Dolby, etc).
-type Showing struct {
-	Time   string
-	Format string // e.g. "Standard", "IMAX", "Dolby Cinema"
+// BigScreenClient fetches showtimes from BigScreen Cinema Guide.
+type BigScreenClient struct {
+	httpClient *http.Client
 }
 
-// GoogleClient uses a headless browser to render Google showtime results.
-type GoogleClient struct{}
-
-// NewGoogleClient creates a new client.
-func NewGoogleClient() (*GoogleClient, error) {
-	return &GoogleClient{}, nil
+// NewBigScreenClient creates a new BigScreen client.
+func NewBigScreenClient() *BigScreenClient {
+	return &BigScreenClient{
+		httpClient: &http.Client{
+			Timeout: 15 * time.Second,
+		},
+	}
 }
 
-// Search queries Google for movie showtimes near the given zip code.
-// It launches a headless Chrome browser via Rod to render the JavaScript-heavy
-// Google search results page, then extracts showtime data from the live DOM.
-func (c *GoogleClient) Search(zip, date string) ([]Movie, error) {
-	// Launch headless Chrome with stealth settings to avoid bot detection.
-	l := launcher.New().
-		Headless(true).
-		NoSandbox(true).
-		Set("disable-blink-features", "AutomationControlled").
-		MustLaunch()
-
-	browser := rod.New().ControlURL(l).MustConnect()
-	defer browser.MustClose()
-
-	// Use stealth page to minimize bot detection.
-	page := stealth.MustPage(browser)
-
-	// Visit Google homepage first to establish a session/cookies.
-	if err := page.Navigate("https://www.google.com"); err != nil {
-		return nil, fmt.Errorf("navigate to google.com: %w", err)
+// SearchShowtimes finds movies showing near the given zip code.
+func (c *BigScreenClient) SearchShowtimes(zip string, radius int, date string) ([]Movie, error) {
+	// Look up the center point for this zip code.
+	centerLat, centerLon, err := zipToLatLon(zip)
+	if err != nil {
+		return nil, err
 	}
-	page.MustWaitStable()
-	time.Sleep(2 * time.Second)
 
-	// Accept cookie consent if present.
-	page.MustEval(`() => {
-		const btns = document.querySelectorAll('button');
-		for (const btn of btns) {
-			if (btn.textContent.includes('Accept all') || btn.textContent.includes('I agree')) {
-				btn.click();
-				return true;
-			}
+	// Find theaters within radius.
+	var nearby []Theater
+	for _, t := range KnownTheaters {
+		dist := haversine(centerLat, centerLon, t.Lat, t.Lon)
+		if dist <= float64(radius) {
+			nearby = append(nearby, t)
 		}
-		return false;
-	}`)
-	time.Sleep(500 * time.Millisecond)
-
-	// Navigate to showtime search results.
-	query := fmt.Sprintf("showtimes near %s", zip)
-	url := fmt.Sprintf("https://www.google.com/search?q=%s&hl=en&gl=us",
-		strings.ReplaceAll(query, " ", "+"))
-
-	if err := page.Navigate(url); err != nil {
-		return nil, fmt.Errorf("navigate to search: %w", err)
-	}
-	page.MustWaitStable()
-	time.Sleep(4 * time.Second)
-
-	// Check for CAPTCHA / block page.
-	finalURL := page.MustEval(`() => window.location.href`).Str()
-	if strings.Contains(finalURL, "/sorry/") {
-		return nil, fmt.Errorf("Google blocked the request (CAPTCHA). This IP may be rate-limited. Try again in a few minutes")
 	}
 
-	htmlSize := page.MustEval(`() => document.documentElement.outerHTML.length`).Int()
-	if htmlSize < 50000 {
-		return nil, fmt.Errorf("received unexpectedly small response (%d bytes), possibly blocked by Google", htmlSize)
+	if len(nearby) == 0 {
+		return nil, fmt.Errorf("no known theaters within %d miles of %s", radius, zip)
 	}
 
-	// Extract showtime data from the rendered DOM using JavaScript.
-	// This script walks the DOM and extracts structured showtime data.
-	result := page.MustEval(`() => {
-		const movies = [];
-		const text = document.body.innerText;
-		const lines = text.split('\n').map(l => l.trim()).filter(l => l);
+	// Fetch showtimes for each theater concurrently (up to 5 at a time).
+	type fetchResult struct {
+		theater Theater
+		movies  []parsedMovie
+		err     error
+	}
 
-		// Strategy 1: Look for structured showtime blocks in Google's result format.
-		// Google typically renders showtimes in a card/widget format with:
-		// - Movie title headings
-		// - Theater names with addresses
-		// - Time buttons/links
+	results := make(chan fetchResult, len(nearby))
+	sem := make(chan struct{}, 5) // concurrency limit
 
-		// Find all time-like patterns and their surrounding context.
-		const timeRe = /\d{1,2}:\d{2}\s*[AaPp]\.?[Mm]\.?/g;
+	var wg sync.WaitGroup
+	for _, t := range nearby {
+		wg.Add(1)
+		go func(theater Theater) {
+			defer wg.Done()
+			sem <- struct{}{}        // acquire
+			defer func() { <-sem }() // release
 
-		// First, try to find the showtime widget container.
-		// Google puts showtime results in specific containers.
-		const allDivs = document.querySelectorAll('div');
-		let showtimeContainer = null;
+			movies, err := c.fetchTheater(theater.ID, date)
+			results <- fetchResult{theater: theater, movies: movies, err: err}
+		}(t)
+	}
 
-		for (const div of allDivs) {
-			const text = div.innerText || '';
-			const times = text.match(timeRe);
-			if (times && times.length >= 3) {
-				// Found a div with multiple showtimes.
-				// Check if it's a reasonable size (not the whole page).
-				if (text.length > 100 && text.length < 20000) {
-					showtimeContainer = div;
-					break;
-				}
-			}
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Merge results: group by movie title.
+	movieMap := make(map[string]*Movie)
+	var movieOrder []string
+
+	for r := range results {
+		if r.err != nil {
+			// Skip theaters that fail; don't abort everything.
+			continue
 		}
-
-		if (!showtimeContainer) {
-			// Fallback: try to parse from body text.
-			return { error: "no showtime container found", textSample: text.substring(0, 2000) };
+		for _, pm := range r.movies {
+			key := pm.Title
+			m, exists := movieMap[key]
+			if !exists {
+				m = &Movie{
+					Title:   pm.Title,
+					Rating:  pm.Rating,
+					Runtime: pm.Runtime,
+				}
+				movieMap[key] = m
+				movieOrder = append(movieOrder, key)
+			}
+			m.Theaters = append(m.Theaters, TheaterShowtime{
+				TheaterID: r.theater.ID,
+				Name:      r.theater.Name,
+				City:      r.theater.City,
+				Showtimes: pm.Showtimes,
+				Features:  pm.Features,
+			})
 		}
-
-		// Parse the showtime container.
-		// The structure varies, but generally follows this pattern:
-		// [Movie Title]
-		//   [Rating info, runtime]
-		//   [Theater Name] [Distance]
-		//   [Address]
-		//   [Time1] [Time2] [Time3]
-		//   [Another Theater Name]
-		//   [Times...]
-
-		const containerText = showtimeContainer.innerText;
-		const containerLines = containerText.split('\n').map(l => l.trim()).filter(l => l);
-
-		let currentMovie = null;
-		let currentTheater = null;
-		const movieMap = new Map();
-		const movieOrder = [];
-
-		const isTime = (s) => /^\d{1,2}:\d{2}\s*[AaPp]\.?[Mm]\.?$/.test(s.trim());
-		const isTimeLine = (s) => {
-			// A line is a "time line" if it contains multiple times or is just a single time.
-			const times = s.match(timeRe);
-			return times && times.length >= 1;
-		};
-		const isAddress = (s) => /\d+\s+\w+\s+(St|Ave|Blvd|Dr|Rd|Way|Ln|Ct|Pl|Pkwy|Hwy|Street|Avenue|Boulevard|Drive|Road)/i.test(s);
-		const isDistance = (s) => /^\d+\.?\d*\s*(mi|miles?|km)\s*$/i.test(s.trim());
-		const isRating = (s) => /^(G|PG|PG-13|R|NC-17|NR|Not Rated)\s*$/i.test(s.trim()) || /^\d+h\s*\d*m?$/.test(s.trim()) || /^\d+\s*hr\s*\d*\s*min/.test(s.trim());
-		const isMovieGenre = (s) => /^(Action|Adventure|Animation|Comedy|Crime|Documentary|Drama|Family|Fantasy|Horror|Music|Mystery|Romance|Sci-Fi|Thriller|War|Western)\s*$/i.test(s.trim());
-		const isNavOrUI = (s) => /^(All|Images|Videos|Maps|News|Shopping|More|Tools|Settings|Sign in|Search|About|Help|Privacy|Terms)$/i.test(s.trim());
-
-		// More nuanced parsing: look for elements that are links (likely movie titles or theater names)
-		const links = showtimeContainer.querySelectorAll('a');
-		const linkTexts = new Set();
-		for (const link of links) {
-			const text = link.innerText.trim();
-			const href = link.href || '';
-			if (text && text.length > 2 && text.length < 80) {
-				linkTexts.add(text);
-			}
-		}
-
-		// Try a simpler approach: just extract all times and group them with nearby headings.
-		for (let i = 0; i < containerLines.length; i++) {
-			const line = containerLines[i];
-
-			// Skip empty, nav, and UI lines.
-			if (isNavOrUI(line) || line.length <= 1) continue;
-
-			// If this line contains times, add them to current theater.
-			if (isTimeLine(line)) {
-				const times = line.match(timeRe);
-				if (times && currentTheater) {
-					for (const t of times) {
-						currentTheater.showings.push({ time: t.trim(), format: "Standard" });
-					}
-				}
-				continue;
-			}
-
-			// Skip known patterns.
-			if (isDistance(line) || isRating(line) || isMovieGenre(line)) {
-				if (isDistance(line) && currentTheater) {
-					currentTheater.distance = line.trim();
-				}
-				continue;
-			}
-
-			if (isAddress(line)) {
-				if (currentTheater) {
-					currentTheater.address = line.trim();
-				}
-				continue;
-			}
-
-			// Potential movie or theater name.
-			// Heuristic: if the next few lines contain times, this is a theater name.
-			// If the line after this is another potential name followed by times, this is a movie title.
-			let nextTimeLineIdx = -1;
-			for (let j = i + 1; j < Math.min(i + 5, containerLines.length); j++) {
-				if (isTimeLine(containerLines[j])) {
-					nextTimeLineIdx = j;
-					break;
-				}
-			}
-
-			if (nextTimeLineIdx > 0) {
-				// This line is likely a theater name (times follow closely).
-				// But first, check if this is actually a movie title with theaters below.
-				// A movie title usually appears with rating/runtime info nearby.
-
-				// Simple heuristic: if the line is in linkTexts and seems like a proper name,
-				// treat it based on whether there's already a current movie.
-				if (!currentMovie) {
-					// First potential heading - treat as movie.
-					currentMovie = { title: line, theaters: [] };
-					movieMap.set(line, currentMovie);
-					movieOrder.push(line);
-					currentTheater = { name: "Unknown Theater", address: "", distance: "", showings: [] };
-					currentMovie.theaters.push(currentTheater);
-				} else {
-					// Already have a movie - this could be a theater name.
-					if (currentTheater && currentTheater.showings.length > 0) {
-						// Previous theater had times, start a new theater.
-						currentTheater = { name: line, address: "", distance: "", showings: [] };
-						currentMovie.theaters.push(currentTheater);
-					} else if (currentTheater && currentTheater.name === "Unknown Theater") {
-						currentTheater.name = line;
-					} else {
-						// Could be a new movie or theater.
-						// If this looks more like a movie title (longer, mixed case), treat as movie.
-						if (line.length > 15 || /[A-Z].*[a-z].*[A-Z]/.test(line)) {
-							// Possibly a new movie title
-							if (currentTheater && currentTheater.showings.length === 0) {
-								// Remove empty theater.
-								currentMovie.theaters = currentMovie.theaters.filter(t => t.showings.length > 0);
-							}
-							currentMovie = { title: line, theaters: [] };
-							movieMap.set(line, currentMovie);
-							movieOrder.push(line);
-							currentTheater = null;
-						} else {
-							currentTheater = { name: line, address: "", distance: "", showings: [] };
-							currentMovie.theaters.push(currentTheater);
-						}
-					}
-				}
-			} else if (currentMovie && !isTimeLine(line) && line.length > 3) {
-				// No times nearby - could be a new movie title.
-				// Check if the previous movie has any theater data.
-				if (currentMovie.theaters.some(t => t.showings.length > 0)) {
-					// Previous movie had data, this might be a new movie.
-					currentMovie = { title: line, theaters: [] };
-					movieMap.set(line, currentMovie);
-					movieOrder.push(line);
-					currentTheater = null;
-				}
-			}
-		}
-
-		// Build result.
-		const result = [];
-		for (const title of movieOrder) {
-			const m = movieMap.get(title);
-			const theaters = m.theaters.filter(t => t.showings.length > 0);
-			if (theaters.length > 0) {
-				result.push({ title: m.title, theaters: theaters });
-			}
-		}
-
-		return {
-			movies: result,
-			containerTextLength: containerText.length,
-			lineCount: containerLines.length,
-		};
-	}`)
-
-	// Parse the JS result.
-	if errMsg := result.Get("error").Str(); errMsg != "" {
-		textSample := result.Get("textSample").Str()
-		return nil, fmt.Errorf("%s. Page text sample: %s", errMsg, truncate(textSample, 500))
 	}
 
-	moviesJSON := result.Get("movies").JSON("", "")
-	if moviesJSON == "" || moviesJSON == "null" {
-		return nil, fmt.Errorf("no movies extracted from DOM")
-	}
-
-	var rawMovies []struct {
-		Title    string `json:"title"`
-		Theaters []struct {
-			Name     string `json:"name"`
-			Address  string `json:"address"`
-			Distance string `json:"distance"`
-			Showings []struct {
-				Time   string `json:"time"`
-				Format string `json:"format"`
-			} `json:"showings"`
-		} `json:"theaters"`
-	}
-
-	if err := json.Unmarshal([]byte(moviesJSON), &rawMovies); err != nil {
-		return nil, fmt.Errorf("parse extracted data: %w", err)
-	}
-
+	// Build sorted result.
 	var movies []Movie
-	for _, rm := range rawMovies {
-		m := Movie{Title: rm.Title}
-		for _, rt := range rm.Theaters {
-			t := TheaterShowings{
-				Name:     rt.Name,
-				Address:  rt.Address,
-				Distance: rt.Distance,
-			}
-			for _, rs := range rt.Showings {
-				t.Showings = append(t.Showings, Showing{
-					Time:   rs.Time,
-					Format: rs.Format,
-				})
-			}
-			m.Theaters = append(m.Theaters, t)
-		}
-		movies = append(movies, m)
+	sort.Strings(movieOrder)
+	for _, key := range movieOrder {
+		movies = append(movies, *movieMap[key])
 	}
 
 	return movies, nil
 }
 
-// FormatShowings returns a compact string of times grouped by format.
-func FormatShowings(showings []Showing) string {
-	byFormat := make(map[string][]string)
-	var formatOrder []string
-	for _, s := range showings {
-		if _, exists := byFormat[s.Format]; !exists {
-			formatOrder = append(formatOrder, s.Format)
-		}
-		byFormat[s.Format] = append(byFormat[s.Format], s.Time)
-	}
-
-	var parts []string
-	for _, f := range formatOrder {
-		times := strings.Join(byFormat[f], ", ")
-		if f == "Standard" || f == "" {
-			parts = append(parts, times)
-		} else {
-			parts = append(parts, fmt.Sprintf("[%s] %s", f, times))
-		}
-	}
-	return strings.Join(parts, "  |  ")
+// parsedMovie is the raw parsed data from a single theater page.
+type parsedMovie struct {
+	Title     string
+	Rating    string
+	Runtime   string
+	Showtimes []string
+	Features  string
 }
 
-func truncate(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
+// fetchTheater fetches and parses the printable showtime page for one theater.
+func (c *BigScreenClient) fetchTheater(theaterID int, date string) ([]parsedMovie, error) {
+	url := fmt.Sprintf(
+		"https://www.bigscreen.com/Marquee.php?theater=%d&view=sched&printable=1&showdate=%s",
+		theaterID, date,
+	)
+
+	resp, err := c.httpClient.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("fetch theater %d: %w", theaterID, err)
 	}
-	return s[:maxLen] + "..."
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("theater %d returned status %d", theaterID, resp.StatusCode)
+	}
+
+	return parseShowtimePage(resp.Body)
+}
+
+// parseShowtimePage parses the BigScreen printable HTML page.
+// Structure:
+//
+//	<div class="infoitem">
+//	  <div class="infoitem_data movie">
+//	    <span class="movie_name">Title</span><br>
+//	    <span class="notes">[ Rating ] Runtime</span>
+//	  </div>
+//	  <div class="infoitem_data showtimes">
+//	    <span class="showtimes">1:30, 6:15, 8:30</span><br>
+//	    <span class="notes">Stadium Seating; Digital Projection</span>
+//	  </div>
+//	</div>
+func parseShowtimePage(r interface{ Read([]byte) (int, error) }) ([]parsedMovie, error) {
+	doc, err := html.Parse(r)
+	if err != nil {
+		return nil, fmt.Errorf("parse HTML: %w", err)
+	}
+
+	var movies []parsedMovie
+
+	// Walk the DOM looking for div.infoitem elements.
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if n.Type == html.ElementNode && n.Data == "div" && hasClass(n, "infoitem") && !hasClass(n, "infoheading") {
+			pm := extractMovie(n)
+			if pm.Title != "" && len(pm.Showtimes) > 0 {
+				movies = append(movies, pm)
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(doc)
+
+	return movies, nil
+}
+
+// extractMovie extracts movie info from a single div.infoitem node.
+func extractMovie(n *html.Node) parsedMovie {
+	var pm parsedMovie
+
+	// Find the movie_name span.
+	movieNameSpan := findSpanByClass(n, "movie_name")
+	if movieNameSpan != nil {
+		pm.Title = textContent(movieNameSpan)
+	}
+
+	// Find the notes span inside the movie div (contains rating and runtime).
+	movieDiv := findDivByClass(n, "movie")
+	if movieDiv != nil {
+		notesSpan := findSpanByClass(movieDiv, "notes")
+		if notesSpan != nil {
+			ratingRuntime := textContent(notesSpan)
+			pm.Rating, pm.Runtime = parseRatingRuntime(ratingRuntime)
+		}
+	}
+
+	// Find showtimes span.
+	showtimesDiv := findDivByClasses(n, "infoitem_data", "showtimes")
+	if showtimesDiv == nil {
+		// Try finding any div that contains a span.showtimes
+		showtimesDiv = findDivContainingSpanClass(n, "showtimes")
+	}
+	if showtimesDiv != nil {
+		stSpan := findSpanByClass(showtimesDiv, "showtimes")
+		if stSpan != nil {
+			timesStr := textContent(stSpan)
+			pm.Showtimes = parseShowtimesList(timesStr)
+		}
+		// Features are in the notes span inside the showtimes div.
+		featSpan := findSpanByClass(showtimesDiv, "notes")
+		if featSpan != nil {
+			pm.Features = cleanFeatures(textContent(featSpan))
+		}
+	}
+
+	return pm
+}
+
+// parseRatingRuntime parses "[ PG-13 ] 1:35" into rating and runtime.
+func parseRatingRuntime(s string) (string, string) {
+	s = strings.TrimSpace(s)
+	// Pattern: [ Rating ] Runtime
+	re := regexp.MustCompile(`\[\s*(.+?)\s*\]\s*(.+)`)
+	matches := re.FindStringSubmatch(s)
+	if len(matches) == 3 {
+		return strings.TrimSpace(matches[1]), strings.TrimSpace(matches[2])
+	}
+	return "", s
+}
+
+// parseShowtimesList splits "1:30, 6:15, 8:30" or "11:00a, 3:45" into a slice.
+func parseShowtimesList(s string) []string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	var times []string
+	for _, p := range parts {
+		t := strings.TrimSpace(p)
+		if t != "" {
+			times = append(times, t)
+		}
+	}
+	return times
+}
+
+// cleanFeatures tidies up the features string.
+func cleanFeatures(s string) string {
+	s = strings.TrimSpace(s)
+	// Remove "Inaccessible" as it's not useful info.
+	parts := strings.Split(s, ";")
+	var cleaned []string
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" && !strings.EqualFold(p, "Inaccessible") {
+			cleaned = append(cleaned, p)
+		}
+	}
+	return strings.Join(cleaned, "; ")
+}
+
+// === HTML helpers ===
+
+func hasClass(n *html.Node, class string) bool {
+	for _, attr := range n.Attr {
+		if attr.Key == "class" {
+			for _, c := range strings.Fields(attr.Val) {
+				if c == class {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func getClass(n *html.Node) string {
+	for _, attr := range n.Attr {
+		if attr.Key == "class" {
+			return attr.Val
+		}
+	}
+	return ""
+}
+
+func findSpanByClass(n *html.Node, class string) *html.Node {
+	if n.Type == html.ElementNode && n.Data == "span" && hasClass(n, class) {
+		return n
+	}
+	for c := n.FirstChild; c != nil; c = c.NextSibling {
+		if found := findSpanByClass(c, class); found != nil {
+			return found
+		}
+	}
+	return nil
+}
+
+func findDivByClass(n *html.Node, class string) *html.Node {
+	for c := n.FirstChild; c != nil; c = c.NextSibling {
+		if c.Type == html.ElementNode && c.Data == "div" && hasClass(c, class) {
+			return c
+		}
+		if found := findDivByClass(c, class); found != nil {
+			return found
+		}
+	}
+	return nil
+}
+
+func findDivByClasses(n *html.Node, classes ...string) *html.Node {
+	for c := n.FirstChild; c != nil; c = c.NextSibling {
+		if c.Type == html.ElementNode && c.Data == "div" {
+			cls := getClass(c)
+			allMatch := true
+			for _, want := range classes {
+				if !strings.Contains(cls, want) {
+					allMatch = false
+					break
+				}
+			}
+			if allMatch {
+				return c
+			}
+		}
+		if found := findDivByClasses(c, classes...); found != nil {
+			return found
+		}
+	}
+	return nil
+}
+
+func findDivContainingSpanClass(n *html.Node, spanClass string) *html.Node {
+	for c := n.FirstChild; c != nil; c = c.NextSibling {
+		if c.Type == html.ElementNode && c.Data == "div" {
+			if findSpanByClass(c, spanClass) != nil {
+				return c
+			}
+		}
+		if found := findDivContainingSpanClass(c, spanClass); found != nil {
+			return found
+		}
+	}
+	return nil
+}
+
+func textContent(n *html.Node) string {
+	if n.Type == html.TextNode {
+		return n.Data
+	}
+	var sb strings.Builder
+	for c := n.FirstChild; c != nil; c = c.NextSibling {
+		sb.WriteString(textContent(c))
+	}
+	return strings.TrimSpace(sb.String())
+}
+
+// === Geo helpers ===
+
+// haversine returns the distance in miles between two lat/lon points.
+func haversine(lat1, lon1, lat2, lon2 float64) float64 {
+	const earthRadiusMi = 3958.8
+	dLat := (lat2 - lat1) * math.Pi / 180
+	dLon := (lon2 - lon1) * math.Pi / 180
+	a := math.Sin(dLat/2)*math.Sin(dLat/2) +
+		math.Cos(lat1*math.Pi/180)*math.Cos(lat2*math.Pi/180)*
+			math.Sin(dLon/2)*math.Sin(dLon/2)
+	c := 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
+	return earthRadiusMi * c
+}
+
+// zipToLatLon maps a zip code to approximate lat/lon.
+// Covers Bay Area, Central Valley, and Sacramento zips.
+var zipCoords = map[string][2]float64{
+	// Berkeley / Albany
+	"94701": {37.8680, -122.2690}, "94702": {37.8640, -122.2840},
+	"94703": {37.8625, -122.2760}, "94704": {37.8688, -122.2579},
+	"94705": {37.8590, -122.2390}, "94706": {37.8880, -122.2980},
+	"94707": {37.8930, -122.2730}, "94708": {37.8920, -122.2620},
+	"94709": {37.8790, -122.2640}, "94710": {37.8650, -122.3000},
+	// Oakland
+	"94601": {37.7760, -122.2160}, "94602": {37.7990, -122.2100},
+	"94603": {37.7380, -122.1820}, "94604": {37.8050, -122.2700},
+	"94605": {37.7600, -122.1600}, "94606": {37.7930, -122.2420},
+	"94607": {37.8060, -122.2860}, "94608": {37.8350, -122.2830},
+	"94609": {37.8360, -122.2630}, "94610": {37.8120, -122.2380},
+	"94611": {37.8290, -122.2200}, "94612": {37.8050, -122.2700},
+	"94613": {37.7830, -122.1890}, "94618": {37.8440, -122.2410},
+	"94619": {37.7830, -122.1950}, "94621": {37.7540, -122.2020},
+	// Emeryville
+	"94608a": {37.8310, -122.2840}, // covered by 94608
+	// Alameda
+	"94501": {37.7650, -122.2420}, "94502": {37.7350, -122.2420},
+	// El Cerrito / Richmond
+	"94530": {37.9160, -122.3100}, "94801": {37.9380, -122.3580},
+	"94804": {37.9220, -122.3500}, "94805": {37.9340, -122.3330},
+	// Walnut Creek
+	"94595": {37.8850, -122.0600}, "94596": {37.9000, -122.0650},
+	"94597": {37.9100, -122.0500}, "94598": {37.9050, -122.0400},
+	// Concord
+	"94518": {37.9770, -122.0310}, "94519": {37.9680, -122.0010},
+	"94520": {37.9780, -122.0310}, "94521": {37.9630, -121.9760},
+	// Pleasant Hill
+	"94523": {37.9530, -122.0600},
+	// Lafayette
+	"94549": {37.8860, -122.1230},
+	// Orinda
+	"94563": {37.8770, -122.1830},
+	// Moraga
+	"94556": {37.8350, -122.1300},
+	// Danville / San Ramon
+	"94506": {37.8070, -121.9150}, "94526": {37.8210, -121.9680},
+	"94583": {37.7620, -121.9500},
+	// Martinez
+	"94553": {38.0020, -122.1340},
+	// Dublin / Pleasanton
+	"94568": {37.7070, -121.9310}, "94588": {37.6960, -121.9260},
+	"94566": {37.6600, -121.8750},
+	// Livermore
+	"94550": {37.6820, -121.7680}, "94551": {37.6930, -121.7130},
+	// Fremont
+	"94536": {37.5600, -121.9800}, "94538": {37.5370, -121.9820},
+	"94539": {37.5190, -121.9420}, "94555": {37.5530, -122.0470},
+	// Hayward
+	"94541": {37.6690, -122.0810}, "94542": {37.6520, -122.0470},
+	"94544": {37.6340, -122.0490}, "94545": {37.6300, -122.1000},
+	// Castro Valley
+	"94546": {37.6940, -122.0830}, "94552": {37.7050, -122.0580},
+	// Union City / Newark
+	"94587": {37.5930, -122.0180}, "94560": {37.5300, -122.0400},
+	// San Leandro
+	"94577": {37.7250, -122.1570}, "94578": {37.7080, -122.1270},
+	"94579": {37.6970, -122.1430},
+	// Larkspur / Mill Valley / Tiburon / Novato (Marin)
+	"94939": {37.9340, -122.5350}, "94941": {37.9060, -122.5460},
+	"94920": {37.8730, -122.4560}, "94947": {38.1010, -122.5570},
+	"94949": {38.0870, -122.5550},
+	// Stockton
+	"95204": {37.9540, -121.3000}, "95207": {37.9780, -121.3110},
+	"95209": {37.9930, -121.3280}, "95210": {38.0100, -121.2970},
+	// Tracy
+	"95376": {37.7350, -121.4260}, "95377": {37.7240, -121.4400},
+	// Manteca
+	"95336": {37.8050, -121.2200}, "95337": {37.7900, -121.2350},
+	// Lodi
+	"95240": {38.1300, -121.2720}, "95242": {38.1200, -121.2900},
+	// Modesto
+	"95350": {37.6370, -120.9940}, "95354": {37.6390, -120.9960},
+	"95355": {37.6550, -121.0050}, "95356": {37.6610, -120.9730},
+	// Sacramento
+	"95811": {38.5720, -121.4930}, "95814": {38.5775, -121.4920},
+	"95816": {38.5680, -121.4720}, "95818": {38.5570, -121.4900},
+	"95819": {38.5630, -121.4580}, "95820": {38.5370, -121.4710},
+	"95822": {38.5200, -121.4940}, "95825": {38.5900, -121.4200},
+	"95834": {38.6380, -121.5010},
+}
+
+func zipToLatLon(zip string) (float64, float64, error) {
+	coords, ok := zipCoords[zip]
+	if !ok {
+		return 0, 0, fmt.Errorf("unknown zip code: %s (add it to the zip database or use a known Bay Area / Central Valley zip)", zip)
+	}
+	return coords[0], coords[1], nil
 }

@@ -4,12 +4,14 @@ A Go CLI tool that searches for movie showtimes near a US zip code.
 
 ## Data Source
 
-Uses a headless Chrome browser (via [Rod](https://go-rod.github.io/)) to render
-Google Search showtime results. Google's showtime data requires JavaScript
-rendering, so a headless browser is necessary. No API keys required.
+Scrapes **BigScreen Cinema Guide** ([bigscreen.com](https://www.bigscreen.com))
+printable showtime pages. No API keys needed, no JavaScript rendering, no
+headless browser — just plain HTTP requests to deterministic, static HTML pages.
 
-**Note:** Rod auto-downloads Chromium (~170MB) on first run. Subsequent runs
-use the cached browser.
+URL format:
+```
+https://www.bigscreen.com/Marquee.php?theater={ID}&view=sched&printable=1&showdate={YYYY-MM-DD}
+```
 
 ## Build
 
@@ -24,44 +26,34 @@ go build -o movie-cli .
 ./movie-cli showtimes 94703
 
 # Specify date and radius
-./movie-cli showtimes 94703 --radius 20 --date 2026-04-17
-
-# Plain text output (for piping / agent use)
-./movie-cli showtimes 94703 --headless
+./movie-cli showtimes 94703 --radius 30 --date 2026-04-17
 ```
 
 ## Output
 
 Movies are grouped by title. Under each movie, theaters are listed with:
-- Theater name and distance from zip
-- Theater address
-- Showtimes grouped by format (Standard, IMAX, Dolby Cinema, etc.)
+- Theater name and city
+- Showtimes (AM times suffixed with "a", PM times without)
+- Features (Stadium Seating, IMAX, Digital Projection, etc.)
 
 ## How It Works
 
-The tool uses Rod (`github.com/go-rod/rod`) to launch a headless Chromium
-browser with stealth settings (`github.com/go-rod/stealth`) to minimize bot
-detection. It navigates to Google Search, waits for JavaScript to render the
-showtime widget, then extracts structured data from the live DOM using
-JavaScript evaluation.
+1. Maps the given zip code to lat/lon coordinates (hardcoded database)
+2. Finds all known theaters within the search radius using haversine distance
+3. Fetches the BigScreen printable showtime page for each theater (concurrent, up to 5 at a time)
+4. Parses the HTML to extract movie titles, ratings, runtimes, and showtimes
+5. Merges results: groups by movie title across all theaters
+6. Returns sorted by movie title
 
-Key implementation details:
-- **Stealth mode**: Uses `go-rod/stealth` to avoid Google's bot detection
-  (patches `navigator.webdriver`, plugins, languages, etc.)
-- **Session establishment**: Visits `google.com` first to get cookies before
-  searching
-- **DOM extraction**: Runs JavaScript in the browser context to walk the
-  rendered DOM and extract movie titles, theater names, addresses, and
-  showtimes
-- **CAPTCHA handling**: Detects Google CAPTCHA pages and returns a clear error
-  message suggesting retry
+## Theater Coverage
 
-## Known Limitations
-
-- Google may rate-limit or CAPTCHA requests from server/datacenter IPs. The
-  tool works best from residential IPs or when not making frequent requests.
-- The DOM parser uses heuristics to extract showtime data from Google's
-  rendered HTML, which may break if Google changes their page structure.
+The hardcoded theater database includes 45+ theaters covering:
+- **East Bay**: Berkeley, Oakland, Emeryville, Alameda, El Cerrito, Richmond
+- **Tri-Valley**: Walnut Creek, Concord, Pleasant Hill, Lafayette, Orinda, Moraga, Danville, Dublin, Pleasanton, Livermore
+- **South Bay (partial)**: Fremont, Hayward, Castro Valley, Union City, San Leandro, Newark
+- **Marin**: Larkspur, Mill Valley, Tiburon, Novato
+- **Central Valley**: Stockton, Tracy, Manteca, Lodi, Modesto
+- **Sacramento**: Downtown, midtown theaters
 
 ## Project Structure
 
@@ -73,7 +65,8 @@ movies/
 │       └── showtimes.go    # Showtimes subcommand
 ├── internal/
 │   ├── showtimes/
-│   │   └── provider.go     # Google scraper with headless Chrome (Rod)
+│   │   ├── provider.go     # BigScreen scraper (plain HTTP + HTML parsing)
+│   │   └── theaters.go     # Hardcoded theater database with lat/lon
 │   └── display/
 │       └── display.go      # Output formatting
 ├── main.go                 # Entry point

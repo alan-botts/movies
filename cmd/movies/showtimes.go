@@ -12,15 +12,14 @@ import (
 )
 
 var (
-	radius   int
-	date     string
-	headless bool
+	radius int
+	date   string
 )
 
 var showtimesCmd = &cobra.Command{
 	Use:   "showtimes <zip>",
 	Short: "Search for movie showtimes near a zip code",
-	Long:  "Search for movie showtimes at theaters near the given US zip code by scraping Google directly.",
+	Long:  "Search for movie showtimes at theaters near the given US zip code using BigScreen Cinema Guide.",
 	Args:  cobra.ExactArgs(1),
 	RunE:  runShowtimes,
 }
@@ -28,7 +27,6 @@ var showtimesCmd = &cobra.Command{
 func init() {
 	showtimesCmd.Flags().IntVar(&radius, "radius", 20, "Search radius in miles")
 	showtimesCmd.Flags().StringVar(&date, "date", "", "Date to search (YYYY-MM-DD, defaults to today)")
-	showtimesCmd.Flags().BoolVar(&headless, "headless", false, "Plain text output (no TUI)")
 	rootCmd.AddCommand(showtimesCmd)
 }
 
@@ -54,12 +52,9 @@ func runShowtimes(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("Searching showtimes near %s (radius: %d mi, date: %s)...\n\n", zip, radius, date)
 
-	client, err := showtimes.NewGoogleClient()
-	if err != nil {
-		return fmt.Errorf("failed to create client: %w", err)
-	}
+	client := showtimes.NewBigScreenClient()
 
-	results, err := client.Search(zip, date)
+	results, err := client.SearchShowtimes(zip, radius, date)
 	if err != nil {
 		return fmt.Errorf("showtime search failed: %w", err)
 	}

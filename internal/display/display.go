@@ -16,8 +16,16 @@ func PrintShowtimes(movies []showtimes.Movie, zip, date string) {
 		if i > 0 {
 			fmt.Println()
 		}
-		fmt.Printf("\n%s\n", movie.Title)
-		fmt.Println(strings.Repeat("-", len(movie.Title)))
+		// Movie title with rating and runtime.
+		header := movie.Title
+		if movie.Rating != "" {
+			header += fmt.Sprintf(" [%s]", movie.Rating)
+		}
+		if movie.Runtime != "" {
+			header += fmt.Sprintf(" (%s)", movie.Runtime)
+		}
+		fmt.Printf("\n%s\n", header)
+		fmt.Println(strings.Repeat("-", len(header)))
 
 		if len(movie.Theaters) == 0 {
 			fmt.Println("  No theaters found.")
@@ -26,26 +34,26 @@ func PrintShowtimes(movies []showtimes.Movie, zip, date string) {
 
 		for _, theater := range movie.Theaters {
 			fmt.Printf("\n  %s", theater.Name)
-			if theater.Distance != "" {
-				fmt.Printf("  (%s)", theater.Distance)
+			if theater.City != "" {
+				fmt.Printf(" — %s", theater.City)
 			}
 			fmt.Println()
-			if theater.Address != "" {
-				fmt.Printf("  %s\n", theater.Address)
-			}
 
-			if len(theater.Showings) == 0 {
-				fmt.Println("  No showtimes available.")
+			if len(theater.Showtimes) == 0 {
+				fmt.Println("    No showtimes available.")
 				continue
 			}
 
-			timesStr := showtimes.FormatShowings(theater.Showings)
-			fmt.Printf("  Times: %s\n", timesStr)
+			fmt.Printf("    %s\n", strings.Join(theater.Showtimes, ", "))
+
+			if theater.Features != "" {
+				fmt.Printf("    [%s]\n", theater.Features)
+			}
 		}
 	}
 
 	fmt.Printf("\n%s\n", strings.Repeat("=", 60))
-	fmt.Printf("Data scraped from Google Showtimes. %d movies, %d theaters total.\n",
+	fmt.Printf("Data from BigScreen Cinema Guide (bigscreen.com). %d movies, %d theaters.\n",
 		len(movies), countTheaters(movies))
 }
 
