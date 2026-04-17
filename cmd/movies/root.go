@@ -5,9 +5,9 @@ import (
 )
 
 var rootCmd = &cobra.Command{
-	Use:   "movies",
-	Short: "Movie showtime search CLI",
-	Long:  "A CLI tool that searches for movie showtimes near a given zip code using BigScreen Cinema Guide.",
+	Use:   "movie-watcher",
+	Short: "Movie showtime search CLI — no API keys needed",
+	Long:  "Search for movie showtimes near a US zip code. Scrapes BigScreen Cinema Guide — no API keys, no JS rendering, fully deterministic.",
 }
 
 func Execute() error {

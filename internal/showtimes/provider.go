@@ -47,7 +47,7 @@ func NewBigScreenClient() *BigScreenClient {
 // SearchShowtimes finds movies showing near the given zip code.
 func (c *BigScreenClient) SearchShowtimes(zip string, radius int, date string) ([]Movie, error) {
 	// Look up the center point for this zip code.
-	centerLat, centerLon, err := zipToLatLon(zip)
+	centerLat, centerLon, err := ZipToLatLon(zip)
 	if err != nil {
 		return nil, err
 	}
@@ -483,7 +483,8 @@ var zipCoords = map[string][2]float64{
 	"95834": {38.6380, -121.5010},
 }
 
-func zipToLatLon(zip string) (float64, float64, error) {
+// ZipToLatLon maps a zip code to approximate lat/lon coordinates.
+func ZipToLatLon(zip string) (float64, float64, error) {
 	coords, ok := zipCoords[zip]
 	if !ok {
 		return 0, 0, fmt.Errorf("unknown zip code: %s (add it to the zip database or use a known Bay Area / Central Valley zip)", zip)
